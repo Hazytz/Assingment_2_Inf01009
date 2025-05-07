@@ -1,5 +1,6 @@
 
 #include "X11/keysym.h"
+#include "framebuffer.h"
 #include "glm/glm.hpp"
 #include "glm/gtc/matrix_transform.hpp"
 #include "glm/gtc/type_ptr.hpp"
@@ -11,13 +12,15 @@
 #include <GL/freeglut.h>
 #include <GL/glew.h>
 #include <X11/Xlib.h>
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <iostream>
 #include <unistd.h>
 
 using namespace std;
 
-#define WINDOW_TITLE "Assingment 2"
+#define WINDOW_TITLE "Assingment 3"
 
 #ifndef GLSL
 #define GLSL(Version, Source) "#version " #Version "\n" #Source
@@ -58,13 +61,21 @@ float farplane = 10000.0f;
 float nearplane = 0.1f;
 float lastX = 400, lastY = 300;
 bool firstMouse = true;
-float modelColor[3];
+float modelColor[3] = {1.0f, 1.0f, 1.0f};
 int open = -1;
 float hfov = 90.0f;
 float vfov = 60.0f;
 glm::vec3 lightPos(0.0f, 0.0f, 100.0f);
 glm::vec3 lightColor(1.0f, 1.0f, 1.0f);
 glm::vec3 objectColor(1.0f, 1.0f, 1.0f);
+int width;
+int height;
+framebuffer framebuffer(WindowWidth, WindowHeight);
+static GLuint close2glTex = 0;
+static GLuint quadVAO = 0, quadVBO = 0;
+mat4c2gl viewportMatrix;
+int renderMode = 1;
+int shadingMode = 1;
 
 void UResizeWindow(int, int);
 void URenderGraphics(void);
@@ -82,6 +93,11 @@ GLuint compileShader(GLenum type, const GLchar *source);
 GLuint createShaderProgram(const GLchar *vertexSource,
                            const GLchar *fragmentSource);
 void setCommonUniforms(GLuint shaderProgram, int type);
+glm::vec3 ndcToScreen(const glm::vec3 &ndc, int fbWidth, int fbHeight);
+inline float edgeFunction(const glm::vec2 &a, const glm::vec2 &b,
+                          const glm::vec2 &c) {
+  return (c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x);
+}
 
 GLenum err;
 
@@ -95,7 +111,7 @@ const GLchar *vertexShaderSource_GouraudAD = GLSL(
 
     out vec3 mobileColor;
 
-    uniform mat4 model; uniform mat4 view; uniform mat4 projection; uniform mat4 mvpcgl;
+    uniform mat4 model; uniform mat4 view; uniform mat4 projection;
     uniform vec3 lightPos; uniform vec3 lightColor; uniform vec3 objectColor;
 
     void main() {
@@ -190,11 +206,28 @@ const GLchar *fragmentShaderSource_Basic = GLSL(
     out vec4 gpuColor;
 
     void main() { gpuColor = vec4(mobileColor, 1.0); });
+const GLchar *vertexShaderSource_Minimal = GLSL(
+    330, layout(location = 0) in vec2 inPos;
+    layout(location = 1) in vec2 inTexCoord;
 
+    out vec2 vUV;
+
+    void main() {
+      gl_Position = vec4(inPos, 0.0, 1.0);
+      vUV = inTexCoord;
+    });
+
+const GLchar *fragmentShaderSource_Minimal = GLSL(
+    330, uniform sampler2D uTexture;
+
+    in vec2 vUV; out vec4 FragColor;
+
+    void main() { FragColor = texture(uTexture, vUV); });
 GLuint shaderProgram_GouraudAD;
 GLuint shaderProgram_GouraudADS;
 GLuint shaderProgram_Phong;
 GLuint shaderProgram_NoShading;
+GLuint shaderProgram_Minimal;
 
 int main(int argc, char *argv[]) {
 
@@ -235,6 +268,8 @@ int main(int argc, char *argv[]) {
       createShaderProgram(vertexShaderSource_Phong, fragmentShaderSource_Phong);
   shaderProgram_NoShading = createShaderProgram(vertexShaderSource_NoShading,
                                                 fragmentShaderSource_Basic);
+  shaderProgram_Minimal = createShaderProgram(vertexShaderSource_Minimal,
+                                              fragmentShaderSource_Minimal);
 
   shaderProgram = shaderProgram_NoShading;
 
@@ -274,6 +309,11 @@ int main(int argc, char *argv[]) {
     std::cerr << "OpenGL Error: " << err << std::endl;
   }
 
+  glutMouseFunc(ImGui_ImplGLUT_MouseFunc);
+  glutMotionFunc(ImGui_ImplGLUT_MotionFunc);
+  glutPassiveMotionFunc(ImGui_ImplGLUT_MotionFunc);
+  glutMouseWheelFunc(mouseWheel);
+
   modelCenter = calculateCenter();
 
   glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
@@ -306,10 +346,17 @@ bool key_is_pressed(KeySym ks) {
 void UResizeWindow(int w, int h) {
   WindowWidth = w;
   WindowHeight = h;
+  framebuffer.resize(WindowWidth, WindowHeight);
   glViewport(0, 0, WindowWidth, WindowHeight);
+  cout << WindowHeight << "\n";
 }
 
 void URenderGraphics(void) {
+
+  int w = glutGet(GLUT_WINDOW_WIDTH);
+  int h = glutGet(GLUT_WINDOW_HEIGHT);
+
+  glViewport(0, 0, w, h);
 
   ImGui_ImplOpenGL3_NewFrame();
   ImGui_ImplGLUT_NewFrame();
@@ -487,17 +534,49 @@ void URenderGraphics(void) {
 }
 
 void URenderGraphicsClose2GL(void) {
-  glutMouseFunc(ImGui_ImplGLUT_MouseFunc);
-  glutMotionFunc(ImGui_ImplGLUT_MotionFunc);
-  glutPassiveMotionFunc(ImGui_ImplGLUT_MotionFunc);
-  glutMouseWheelFunc(mouseWheel);
+
+  int w = glutGet(GLUT_WINDOW_WIDTH);
+  int h = glutGet(GLUT_WINDOW_HEIGHT);
+
+  if (w != framebuffer.getWidth() || h != framebuffer.getHeight()) {
+    framebuffer.resize(w, h);
+    glViewport(0, 0, w, h);
+    viewportMatrix.setViewportMatrix(0, 0, w, h);
+
+    ImGuiIO &io = ImGui::GetIO();
+    io.DisplaySize = ImVec2((float)w, (float)h);
+
+    glDeleteTextures(1, &close2glTex);
+    close2glTex = 0;
+  }
+
+  if (quadVAO == 0) {
+    float quadVertices[] = {
+        -1.f, -1.f, 0.f, 0.f, 1.f, -1.f, 1.f, 0.f, 1.f,  1.f, 1.f, 1.f,
+        -1.f, -1.f, 0.f, 0.f, 1.f, 1.f,  1.f, 1.f, -1.f, 1.f, 0.f, 1.f,
+    };
+
+    glGenVertexArrays(1, &quadVAO);
+    glGenBuffers(1, &quadVBO);
+    glBindVertexArray(quadVAO);
+
+    glBindBuffer(GL_ARRAY_BUFFER, quadVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), quadVertices,
+                 GL_STATIC_DRAW);
+
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
+                          (void *)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
+                          (void *)(2 * sizeof(float)));
+
+    glBindVertexArray(0);
+  }
 
   ImGui_ImplOpenGL3_NewFrame();
   ImGui_ImplGLUT_NewFrame();
   ImGui::NewFrame();
-
-  glEnable(GL_DEPTH_TEST);
-  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
   mat4c2gl modelcgl(1.0f);
   modelcgl[0][0] = 1.0f;
@@ -572,17 +651,12 @@ void URenderGraphicsClose2GL(void) {
   mat4c2gl projectioncgl;
   projectioncgl.setProjectionMatrixHV(vfov, hfov, nearplane, farplane);
 
-  GLint modelLoc = glGetUniformLocation(shaderProgram, "model");
-  GLint viewLoc = glGetUniformLocation(shaderProgram, "view");
-  GLint projLoc = glGetUniformLocation(shaderProgram, "projection");
-
-
   glGenVertexArrays(1, &VAO);
   glBindVertexArray(VAO);
 
   glCreateBuffers(NumBuffers, Buffers);
 
-  std::vector<GLfloat> culledVertices;
+  std::vector<glm::vec3> culledVertices;
   std::vector<GLfloat> culledNormals;
 
   mat4c2gl mvpcgl = projectioncgl * viewcgl * modelcgl;
@@ -607,8 +681,8 @@ void URenderGraphicsClose2GL(void) {
     glm::vec3 ndc2 = glm::vec3(clip2) / clip2.w;
 
     auto inFrustum = [](const glm::vec3 &ndc) {
-      return ndc.x >= -1 && ndc.x <= 1 && ndc.y >= -1 && ndc.y <= 1 &&
-             ndc.z >= -1 && ndc.z <= 1;
+      return (ndc.x >= -1 && ndc.x <= 1 && ndc.y >= -1 && ndc.y <= 1 &&
+              ndc.z >= -1 && ndc.z <= 1);
     };
 
     if (!(inFrustum(ndc0) || inFrustum(ndc1) || inFrustum(ndc2)))
@@ -621,58 +695,191 @@ void URenderGraphicsClose2GL(void) {
     glm::vec3 v0v1 = mv_v1 - mv_v0;
     glm::vec3 v0v2 = mv_v2 - mv_v0;
     glm::vec3 normal = glm::normalize(glm::cross(v0v1, v0v2));
+
     glm::vec3 viewDir = glm::normalize(mv_v0);
 
     float facing = glm::dot(normal, viewDir);
+
     if ((cullClockwise && facing >= 0) || (!cullClockwise && facing <= 0))
       continue;
 
-    for (int j = 0; j < 9; ++j)
-      culledVertices.push_back(Vert[i * 9 + j]);
+    culledVertices.push_back(ndc0);
+    culledVertices.push_back(ndc1);
+    culledVertices.push_back(ndc2);
+
     for (int j = 0; j < 9; ++j)
       culledNormals.push_back(Vert_Normal[i * 9 + j]);
   }
 
-  glUniformMatrix4fv(mvpcglLoc, 1, GL_FALSE, mvpcgl.toGLMatrix().data());
-  glUniformMatrix4fv(mvcglLoc, 1, GL_FALSE, mvcgl.toGLMatrix().data());
+  // New things*
 
-  GLint lightPosLoc = glGetUniformLocation(shaderProgram, "lightPos");
-  GLint viewPosLoc = glGetUniformLocation(shaderProgram, "viewPos");
-  GLint lightColorLoc = glGetUniformLocation(shaderProgram, "lightColor");
-  GLint objectColorLoc = glGetUniformLocation(shaderProgram, "objectColor");
+  std::vector<glm::vec3> screenVertices;
+  screenVertices.reserve(culledVertices.size());
 
-  glUniform3fv(lightPosLoc, 1, glm::value_ptr(lightPos));
-  glUniform3fv(viewPosLoc, 1, glm::value_ptr(cameraPos));
-  glUniform3fv(lightColorLoc, 1, glm::value_ptr(lightColor));
+  for (size_t i = 0, end = culledVertices.size(); i < end; ++i) {
+    glm::vec3 ndc = culledVertices[i];
+    glm::vec3 sc = ndcToScreen(ndc, w, h);
+    screenVertices.push_back(sc);
+  }
 
-  glm::vec3 objectColor(modelColor[0], modelColor[1], modelColor[2]);
-  glUniform3fv(objectColorLoc, 1, glm::value_ptr(objectColor));
+  framebuffer.clearDepthBuffer(1.0f);
+  framebuffer.clearColorBuffer({0, 0, 0, 255});
 
-  NumVertices = culledVertices.size() / 3;
+  if (renderMode == 0)
+    for (size_t i = 0; i + 2 < screenVertices.size(); i += 3) {
+      auto v0 = screenVertices[i];
+      auto v1 = screenVertices[i + 1];
+      auto v2 = screenVertices[i + 2];
 
-  glBindBuffer(GL_ARRAY_BUFFER, Buffers[VtxBuffer]);
-  glBufferStorage(GL_ARRAY_BUFFER, culledVertices.size() * sizeof(GLfloat),
-                  culledVertices.data(), GL_DYNAMIC_STORAGE_BIT);
+      glm::vec2 a(v0.x, v0.y), b(v1.x, v1.y), c(v2.x, v2.y);
 
-  glVertexAttribPointer(vPosition, 3, GL_FLOAT, GL_FALSE, 0, BUFFER_OFFSET(0));
-  glEnableVertexAttribArray(vPosition);
+      float area = edgeFunction(a, b, c);
+      if (std::fabs(area) < 1e-6f)
+        continue;
 
-  glBindBuffer(GL_ARRAY_BUFFER, Buffers[NormBuffer]);
-  glBufferStorage(GL_ARRAY_BUFFER, culledNormals.size() * sizeof(GLfloat),
-                  culledNormals.data(), GL_DYNAMIC_STORAGE_BIT);
+      // Lighting per vertex
+      glm::vec3 n0 = glm::make_vec3(&culledNormals[(i + 0) * 3]);
+      glm::vec3 n1 = glm::make_vec3(&culledNormals[(i + 1) * 3]);
+      glm::vec3 n2 = glm::make_vec3(&culledNormals[(i + 2) * 3]);
 
-  glVertexAttribPointer(vNormalVertex, 3, GL_FLOAT, GL_FALSE, 0,
-                        BUFFER_OFFSET(0));
-  glEnableVertexAttribArray(vNormalVertex);
+      glm::vec3 p0 = culledVertices[i + 0];
+      glm::vec3 p1 = culledVertices[i + 1];
+      glm::vec3 p2 = culledVertices[i + 2];
 
-  glEnableVertexAttribArray(1);
-  glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, (GLvoid *)0);
+      glm::vec3 modelColorV3 = glm::vec3(modelColor[0], modelColor[1], modelColor[2]);
 
+      auto phongLighting = [&](glm::vec3 normal, glm::vec3 fragPos) {
+        glm::vec3 lightDir = glm::normalize(glm::vec3(lightPos) - fragPos);
+        glm::vec3 viewDir = glm::normalize(cameraPos - fragPos);
+        glm::vec3 reflectDir = glm::reflect(-lightDir, normal);
+
+        float diff = glm::max(glm::dot(normal, lightDir), 0.0f);
+        float spec = pow(glm::max(glm::dot(viewDir, reflectDir), 0.0f), 32.0f);
+
+        glm::vec3 ambient = 0.1f * modelColorV3;
+        glm::vec3 diffuse = 0.6f * diff * modelColorV3;
+        glm::vec3 specular = 0.3f * spec * glm::vec3(1.0f);
+
+        return glm::clamp(ambient + diffuse + specular, 0.0f, 1.0f);
+      };
+
+      glm::vec3 c0 = phongLighting(glm::normalize(n0), p0);
+      glm::vec3 c1 = phongLighting(glm::normalize(n1), p1);
+      glm::vec3 c2 = phongLighting(glm::normalize(n2), p2);
+
+      int x0 = std::max(0, (int)std::floor(std::min({a.x, b.x, c.x})));
+      int y0 = std::max(0, (int)std::floor(std::min({a.y, b.y, c.y})));
+      int x1 = std::min(framebuffer.getWidth() - 1,
+                        (int)std::ceil(std::max({a.x, b.x, c.x})));
+      int y1 = std::min(framebuffer.getHeight() - 1,
+                        (int)std::ceil(std::max({a.y, b.y, c.y})));
+
+      for (int y = y0; y <= y1; ++y) {
+        for (int x = x0; x <= x1; ++x) {
+          glm::vec2 p(x + 0.5f, y + 0.5f);
+
+          float w0 = edgeFunction(b, c, p);
+          float w1 = edgeFunction(c, a, p);
+          float w2 = edgeFunction(a, b, p);
+
+          if (w0 * area < 0 || w1 * area < 0 || w2 * area < 0)
+            continue;
+
+          w0 /= area;
+          w1 /= area;
+          w2 /= area;
+
+          float z = w0 * v0.z + w1 * v1.z + w2 * v2.z;
+
+          float &curDepth = framebuffer.getDepth(x, y);
+          if (z < curDepth) {
+            framebuffer.setDepth(x, y, z);
+
+            glm::vec3 finalColor = w0 * c0 + w1 * c1 + w2 * c2;
+            finalColor = glm::clamp(finalColor, 0.0f, 1.0f);
+
+            std::array<uint8_t, 4> pixelColor = {
+                (uint8_t)(finalColor.r * 255), (uint8_t)(finalColor.g * 255),
+                (uint8_t)(finalColor.b * 255), 255};
+
+            framebuffer.setPixel(x, y, pixelColor);
+          }
+        }
+      }
+    }
+
+  if (renderMode == 1)
+    for (size_t i = 0; i + 2 < screenVertices.size(); i += 3) {
+      glm::vec3 v[3] = {screenVertices[i], screenVertices[i + 1],
+                        screenVertices[i + 2]};
+
+      for (int e = 0; e < 3; ++e) {
+        glm::vec3 p0 = v[e];
+        glm::vec3 p1 = v[(e + 1) % 3];
+
+        float dx = p1.x - p0.x;
+        float dy = p1.y - p0.y;
+        float dz = p1.z - p0.z;
+
+        int steps = (int)std::max(std::fabs(dx), std::fabs(dy));
+        float sx = dx / (float)steps;
+        float sy = dy / (float)steps;
+        float sz = dz / (float)steps;
+
+        float x = p0.x;
+        float y = p0.y;
+        float z = p0.z;
+
+        for (int s = 0; s <= steps; ++s) {
+          int xi = (int)std::round(x);
+          int yi = (int)std::round(y);
+          if (xi >= 0 && xi < framebuffer.getWidth() && yi >= 0 &&
+              yi < framebuffer.getHeight()) {
+
+            float &d = framebuffer.getDepth(xi, yi);
+            if (z < d) {
+              d = z;
+              std::array<uint8_t, 4> col = {
+                  (uint8_t)std::clamp(modelColor[0] * 255.0f, 0.0f, 255.0f),
+                  (uint8_t)std::clamp(modelColor[1] * 255.0f, 0.0f, 255.0f),
+                  (uint8_t)std::clamp(modelColor[2] * 255.0f, 0.0f, 255.0f),
+                  255};
+              framebuffer.setPixel(xi, yi, col);
+            }
+          }
+          x += sx;
+          y += sy;
+          z += sz;
+        }
+      }
+    }
+
+  if (close2glTex == 0) {
+    glActiveTexture(GL_TEXTURE1);
+    glGenTextures(1, &close2glTex);
+    glBindTexture(GL_TEXTURE_2D, close2glTex);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, framebuffer.getWidth(),
+                   framebuffer.getHeight());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  }
+
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, close2glTex);
+  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, framebuffer.getWidth(),
+                  framebuffer.getHeight(), GL_RGBA, GL_UNSIGNED_BYTE,
+                  framebuffer.colorBuffer.data());
+
+  glDisable(GL_DEPTH_TEST);
+
+  glUseProgram(shaderProgram_Minimal);
+  glUniform1i(glGetUniformLocation(shaderProgram_Minimal, "uTexture"), 1);
+  glBindVertexArray(quadVAO);
+  glDrawArrays(GL_TRIANGLES, 0, 6);
   glBindVertexArray(0);
-
-  glutPostRedisplay();
-  glBindVertexArray(VAO);
-  glDrawArrays(GL_TRIANGLES, 0, NumVertices);
+  glUseProgram(0);
 
   ImGui::Begin("Viewer Controls");
   ImGui::Text("FPS: %.2f", fps);
@@ -684,23 +891,7 @@ void URenderGraphicsClose2GL(void) {
   ImGui::ColorEdit3("Model Color", modelColor);
   ImGui::SliderFloat3("Light Position", &lightPos[0], -200.0f, 200.0f);
   ImGui::Checkbox("Free Camera", (bool *)&freeCam);
-  ImGui::Text("Shading Mode:");
-  if (ImGui::Button("Gouraud AD")) {
-    shaderProgram = shaderProgram_GouraudAD;
-    setCommonUniforms(shaderProgram, 0);
-  }
-  if (ImGui::Button("Gouraud ADS")) {
-    shaderProgram = shaderProgram_GouraudADS;
-    setCommonUniforms(shaderProgram, 0);
-  }
-  if (ImGui::Button("Phong")) {
-    shaderProgram = shaderProgram_Phong;
-    setCommonUniforms(shaderProgram, 0);
-  }
-  if (ImGui::Button("No Shading")) {
-    shaderProgram = shaderProgram_NoShading;
-    setCommonUniforms(shaderProgram, 1);
-  }
+  ImGui::Checkbox("Wireframe Mode", (bool *)&renderMode);
   if (ImGui::Button("Reset Camera")) {
     cameraPos = glm::vec3(0.0f, 0.0f, 20.0f);
     cameraFront = glm::vec3(0.0f, 0.0f, -1.0f);
@@ -716,8 +907,9 @@ void URenderGraphicsClose2GL(void) {
   ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
   glutSwapBuffers();
-  glBindVertexArray(0);
   UpdateFPS();
+
+  glutPostRedisplay();
 }
 
 void mouseWheel(int button, int dir, int x, int y) {
@@ -873,4 +1065,15 @@ void setCommonUniforms(GLuint shaderProgram, int type) {
     GLint viewPosLoc = glGetUniformLocation(shaderProgram, "viewPos");
     glUniform3f(viewPosLoc, 0.0f, 0.0f, 5.0f);
   }
+}
+
+glm::vec3 ndcToScreen(const glm::vec3 &ndc, int fbWidth, int fbHeight) {
+  float xN = ndc.x * 0.5f + 0.5f;
+  float yN = ndc.y * 0.5f + 0.5f;
+
+  float xPix = xN * static_cast<float>(fbWidth);
+  float yPix = yN * static_cast<float>(fbHeight);
+  float zPix = ndc.z * 0.5f + 0.5f;
+
+  return {xPix, yPix, zPix};
 }
